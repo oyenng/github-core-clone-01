@@ -85,167 +85,188 @@ export function parsePkt(buf: Buffer, offset: number): Pkt | null {
   };
 }
 
-// Side-band-64k framing: wrap `data` in band-1 frames (max 65515 data bytes
-// per frame so each pkt-line stays well under the 65524 protocol maximum).
+// Side-band framing for protocol v2 fetch replies: the payload travels
+// in band-1 pkt-lines holding at most 65515 data bytes each, which keeps
+// every framed line inside the 65524-byte protocol ceiling. An empty
+// payload still produces one frame carrying only the band byte.
 export function sideBandFrames(data: Buffer): Buffer {
-  const parts: Buffer[] = [];
-  const CHUNK = 65515;
-  for (let off = 0; off < data.length; off += CHUNK) {
-    const slice = data.subarray(off, Math.min(off + CHUNK, data.length));
-    const frame = Buffer.allocUnsafe(slice.length + 1);
-    frame[0] = 0x01;
-    slice.copy(frame, 1);
-    parts.push(pktLine(frame));
+  const frames: Buffer[] = [];
+  const LIMIT = 65515;
+  let cursor = 0;
+  while (cursor < data.length) {
+    const end = Math.min(cursor + LIMIT, data.length);
+    frames.push(pktLine(Buffer.concat([Buffer.from([1]), data.subarray(cursor, end)])));
+    cursor = end;
   }
-  if (parts.length === 0) {
-    const frame = Buffer.allocUnsafe(1);
-    frame[0] = 0x01;
-    parts.push(pktLine(frame));
+  if (frames.length === 0) {
+    frames.push(pktLine(Buffer.from([1])));
   }
-  return Buffer.concat(parts);
+  return Buffer.concat(frames);
 }
 
 // ---------------------------------------------------------------------------
-// Delta application (Git delta format: source size, target size, then a
-// sequence of copy/insert instructions)
+// Delta chains. A git delta describes how to rebuild a target object
+// from a base object: two little-endian varints (base size, target
+// size) followed by instructions that either copy a span of the base
+// (opcode with the high bit set) or insert literal bytes (opcode equal
+// to the insert length).
 // ---------------------------------------------------------------------------
 
-function readVarint(buf: Buffer, pos: number): { value: number; next: number } {
+function decodeVarint(buf: Buffer, start: number): [number, number] {
   let value = 0;
-  let shift = 0;
-  let p = pos;
+  let factor = 1;
+  let pos = start;
   for (;;) {
-    const b = buf[p++];
-    value |= (b & 0x7f) * Math.pow(2, shift);
-    shift += 7;
-    if ((b & 0x80) === 0) break;
+    const byte = buf[pos];
+    pos += 1;
+    value += (byte & 0x7f) * factor;
+    if (byte < 0x80) break;
+    factor *= 128;
   }
-  return { value: value, next: p };
+  return [value, pos];
 }
 
 export function applyDelta(base: Buffer, delta: Buffer): Buffer {
   let pos = 0;
-  const src = readVarint(delta, pos);
-  pos = src.next;
-  if (src.value !== base.length) throw new Error("delta base size mismatch");
-  const tgt = readVarint(delta, pos);
-  pos = tgt.next;
-  const out = Buffer.allocUnsafe(tgt.value);
-  let outPos = 0;
+  let baseSize = 0;
+  [baseSize, pos] = decodeVarint(delta, pos);
+  if (baseSize !== base.length) throw new Error("delta base size mismatch");
+  let targetSize = 0;
+  [targetSize, pos] = decodeVarint(delta, pos);
+
+  const out = Buffer.allocUnsafe(targetSize);
+  let written = 0;
   while (pos < delta.length) {
-    const op = delta[pos++];
-    if (op & 0x80) {
-      let cpOff = 0;
-      let cpSize = 0;
-      if (op & 0x01) cpOff = delta[pos++];
-      if (op & 0x02) cpOff |= delta[pos++] << 8;
-      if (op & 0x04) cpOff |= delta[pos++] << 16;
-      if (op & 0x08) cpOff |= delta[pos++] << 24;
-      if (op & 0x10) cpSize = delta[pos++];
-      if (op & 0x20) cpSize |= delta[pos++] << 8;
-      if (op & 0x40) cpSize |= delta[pos++] << 16;
-      if (cpSize === 0) cpSize = 0x10000;
-      base.copy(out, outPos, cpOff, cpOff + cpSize);
-      outPos += cpSize;
-    } else if (op !== 0) {
-      delta.copy(out, outPos, pos, pos + op);
-      pos += op;
-      outPos += op;
+    const opcode = delta[pos];
+    pos += 1;
+    if (opcode === 0) throw new Error("delta opcode 0");
+    if (opcode & 0x80) {
+      // Copy from base: bits 0-3 of the opcode say which offset bytes
+      // follow, bits 4-6 say which size bytes follow.
+      let offset = 0;
+      for (let bit = 0; bit < 4; bit++) {
+        if (opcode & (1 << bit)) {
+          offset += delta[pos] * 2 ** (8 * bit);
+          pos += 1;
+        }
+      }
+      let size = 0;
+      for (let bit = 0; bit < 3; bit++) {
+        if (opcode & (0x10 << bit)) {
+          size += delta[pos] * 2 ** (8 * bit);
+          pos += 1;
+        }
+      }
+      if (size === 0) size = 0x10000;
+      base.copy(out, written, offset, offset + size);
+      written += size;
     } else {
-      throw new Error("delta opcode 0");
+      // Insert the next `opcode` bytes of the delta itself.
+      delta.copy(out, written, pos, pos + opcode);
+      pos += opcode;
+      written += opcode;
     }
   }
-  if (outPos !== tgt.value) throw new Error("delta target size mismatch");
+  if (written !== targetSize) throw new Error("delta target size mismatch");
   return out;
 }
 
 // ---------------------------------------------------------------------------
-// Packfile building (deterministic: OIDs sorted lexicographically, every
-// object stored whole, zlib level 0 => byte-identical output for identical
-// object sets)
+// Packfile writing. The forge writes the simplest legal pack: objects
+// sorted by OID, each stored whole (never deltified), compressed at
+// zlib level 0, so the same object set always yields the same pack
+// bytes and therefore the same trailer checksum.
 // ---------------------------------------------------------------------------
 
-const TYPE_NUM: Record<string, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
+const PACK_TYPE_CODES: Record<string, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
 
-function packObjectHeader(type: string, size: number): Buffer {
-  const t = TYPE_NUM[type];
-  const bytes: number[] = [];
-  let b = (t << 4) | (size & 0x0f);
-  size = Math.floor(size / 16);
-  while (size > 0) {
-    bytes.push(b | 0x80);
-    b = size & 0x7f;
-    size = Math.floor(size / 128);
+function encodePackEntryHeader(type: string, size: number): Buffer {
+  const code = PACK_TYPE_CODES[type];
+  // The size is split into a 4-bit group (sharing the first byte with
+  // the type code) and then 7-bit groups, least significant first.
+  const groups: number[] = [size % 16];
+  let rest = Math.floor(size / 16);
+  while (rest > 0) {
+    groups.push(rest % 128);
+    rest = Math.floor(rest / 128);
   }
-  bytes.push(b);
+  const bytes: number[] = [];
+  for (let i = 0; i < groups.length; i++) {
+    let byte = groups[i];
+    if (i === 0) byte += code * 16;
+    if (i < groups.length - 1) byte += 0x80;
+    bytes.push(byte);
+  }
   return Buffer.from(bytes);
 }
 
 export function buildPack(rec: RepoRec, oids: string[]): Buffer {
-  const sorted = oids.slice().sort();
-  const parts: Buffer[] = [];
-  const head = Buffer.allocUnsafe(12);
-  head.write("PACK", 0, "ascii");
-  head.writeUInt32BE(2, 4);
-  head.writeUInt32BE(sorted.length, 8);
-  parts.push(head);
-  for (const oid of sorted) {
+  const ordered = oids.slice().sort();
+  const header = Buffer.allocUnsafe(12);
+  header.write("PACK", 0, "ascii");
+  header.writeUInt32BE(2, 4);
+  header.writeUInt32BE(ordered.length, 8);
+  const chunks: Buffer[] = [header];
+  for (const oid of ordered) {
     const obj = rec.objects.get(oid);
     if (obj === undefined) continue;
-    parts.push(packObjectHeader(obj.type, obj.data.length));
-    parts.push(zlib.deflateSync(obj.data, { level: 0 }));
+    chunks.push(encodePackEntryHeader(obj.type, obj.data.length));
+    chunks.push(zlib.deflateSync(obj.data, { level: 0 }));
   }
-  const body = Buffer.concat(parts);
-  const trailer = crypto.createHash("sha1").update(body).digest();
-  return Buffer.concat([body, trailer]);
+  const body = Buffer.concat(chunks);
+  const checksum = crypto.createHash("sha1").update(body).digest();
+  return Buffer.concat([body, checksum]);
 }
 
 // ---------------------------------------------------------------------------
-// Packfile parsing (receive-pack). inflateSync tolerates trailing bytes, so
-// the exact compressed length of each object is found by binary search for
-// the smallest slice that inflates to the declared size.
+// Packfile reading (receive-pack). zlib's inflateSync ignores trailing
+// bytes, so the exact end of one object's compressed stream is found by
+// probing: grow a window exponentially until the slice inflates to the
+// declared size, then binary-search inside that bracket for the
+// smallest working slice.
 // ---------------------------------------------------------------------------
 
-function inflateExact(buf: Buffer, start: number, expectedSize: number): { data: Buffer; next: number } {
-  let lo = 1;
-  let hi = buf.length - start;
-  let best = -1;
-  while (lo <= hi) {
-    const mid = (lo + hi) >> 1;
-    let ok = false;
+function inflateEntry(buf: Buffer, start: number, expectedSize: number): { data: Buffer; next: number } {
+  const available = buf.length - start;
+  const inflatesToSize = (length: number): boolean => {
     try {
-      const out = zlib.inflateSync(buf.subarray(start, start + mid));
-      ok = out.length === expectedSize;
+      return zlib.inflateSync(buf.subarray(start, start + length)).length === expectedSize;
     } catch {
-      ok = false;
+      return false;
     }
-    if (ok) {
-      best = mid;
-      hi = mid - 1;
-    } else {
-      lo = mid + 1;
-    }
+  };
+  let bracketLo = 0;
+  let bracketHi = 1;
+  while (bracketHi < available && !inflatesToSize(bracketHi)) {
+    bracketLo = bracketHi;
+    bracketHi *= 2;
   }
-  if (best < 0) throw new Error("pack object inflate failed");
-  const data = zlib.inflateSync(buf.subarray(start, start + best));
-  return { data: data, next: start + best };
+  if (bracketHi > available) bracketHi = available;
+  if (!inflatesToSize(bracketHi)) throw new Error("pack object inflate failed");
+  while (bracketLo + 1 < bracketHi) {
+    const mid = bracketLo + Math.floor((bracketHi - bracketLo) / 2);
+    if (inflatesToSize(mid)) bracketHi = mid;
+    else bracketLo = mid;
+  }
+  const data = zlib.inflateSync(buf.subarray(start, start + bracketHi));
+  return { data: data, next: start + bracketHi };
 }
 
-interface PackEntry {
+interface RawPackEntry {
   offset: number;
-  typeNum: number;
-  size: number;
-  data: Buffer | null; // inflated payload for full objects; delta payload for deltas
-  baseOid: string | null;
-  baseOffset: number; // absolute pack offset for OFS_DELTA, -1 otherwise
+  typeCode: number;
+  data: Buffer; // inflated payload; for deltas this is the delta itself
+  refBase: string | null; // base OID for REF_DELTA entries
+  ofsBase: number; // absolute pack offset of the base for OFS_DELTA, else -1
 }
 
-const TYPE_NAME: Record<number, string> = { 1: "commit", 2: "tree", 3: "blob", 4: "tag" };
+const PACK_TYPE_NAMES: Record<number, string> = { 1: "commit", 2: "tree", 3: "blob", 4: "tag" };
 
-// Parses and stores every object of a pack stream. Returns stored OIDs.
-// Throws on any structural or checksum problem (nothing is stored then for
-// objects that fail delta resolution; full objects parsed before the error
-// may already be stored, which is harmless — content-addressed).
+// Parse a whole pack stream and store every object it carries in the
+// repo. Returns the stored OIDs. Any structural problem (bad header,
+// checksum mismatch, a delta whose base cannot be found) throws; full
+// objects stored before the failure stay stored, which is safe because
+// storage is content-addressed.
 export function parsePack(rec: RepoRec, pack: Buffer): string[] {
   if (pack.length < 12 + 20) throw new Error("pack too short");
   if (pack.toString("ascii", 0, 4) !== "PACK") throw new Error("bad pack magic");
@@ -256,92 +277,94 @@ export function parsePack(rec: RepoRec, pack: Buffer): string[] {
   const digest = crypto.createHash("sha1").update(pack.subarray(0, pack.length - 20)).digest();
   if (!digest.equals(trailer)) throw new Error("pack checksum mismatch");
 
-  const entries: PackEntry[] = [];
-  const byOffset: Map<number, PackEntry> = new Map();
+  // First pass: walk the entries and inflate each payload.
+  const raw: RawPackEntry[] = [];
+  const rawByOffset = new Map<number, RawPackEntry>();
   let pos = 12;
   for (let i = 0; i < count; i++) {
-    const entryStart = pos;
-    let b = pack[pos++];
-    const typeNum = (b >> 4) & 7;
-    let size = b & 0x0f;
-    let shift = 4;
-    while (b & 0x80) {
-      b = pack[pos++];
-      size |= (b & 0x7f) * Math.pow(2, shift);
-      shift += 7;
+    const entryOffset = pos;
+    let byte = pack[pos];
+    pos += 1;
+    const typeCode = (byte >> 4) & 7;
+    let size = byte & 0x0f;
+    let factor = 16;
+    while (byte & 0x80) {
+      byte = pack[pos];
+      pos += 1;
+      size += (byte & 0x7f) * factor;
+      factor *= 128;
     }
-    let baseOid: string | null = null;
-    let baseOffset = -1;
-    if (typeNum === 6) {
-      // OFS_DELTA
-      let c = pack[pos++];
-      let ofs = c & 0x7f;
+    let refBase: string | null = null;
+    let ofsBase = -1;
+    if (typeCode === 6) {
+      // OFS_DELTA: a negative offset to the base entry, encoded so
+      // that each continuation adds one before shifting.
+      let c = pack[pos];
+      pos += 1;
+      let back = c & 0x7f;
       while (c & 0x80) {
-        c = pack[pos++];
-        ofs = ((ofs + 1) << 7) | (c & 0x7f);
+        c = pack[pos];
+        pos += 1;
+        back = (back + 1) * 128 + (c & 0x7f);
       }
-      baseOffset = entryStart - ofs;
-    } else if (typeNum === 7) {
-      // REF_DELTA
-      baseOid = pack.toString("hex", pos, pos + 20);
+      ofsBase = entryOffset - back;
+    } else if (typeCode === 7) {
+      // REF_DELTA: the base is named by its OID.
+      refBase = pack.toString("hex", pos, pos + 20);
       pos += 20;
     }
-    const inflated = inflateExact(pack, pos, size);
+    const inflated = inflateEntry(pack, pos, size);
     pos = inflated.next;
-    const entry: PackEntry = {
-      offset: entryStart,
-      typeNum: typeNum,
-      size: size,
+    const entry: RawPackEntry = {
+      offset: entryOffset,
+      typeCode: typeCode,
       data: inflated.data,
-      baseOid: baseOid,
-      baseOffset: baseOffset,
+      refBase: refBase,
+      ofsBase: ofsBase,
     };
-    entries.push(entry);
-    byOffset.set(entryStart, entry);
+    raw.push(entry);
+    rawByOffset.set(entryOffset, entry);
   }
 
-  // Resolve entries into stored objects. Full objects first, then deltas
-  // whose bases are known, iterating until no progress is made.
-  const resolvedOid: Map<number, string> = new Map(); // pack offset -> oid
-  const stored: string[] = [];
-  let progress = true;
-  let guard = 0;
-  while (progress && guard++ < 1000) {
-    progress = false;
-    for (const e of entries) {
-      if (resolvedOid.has(e.offset)) continue;
-      if (e.typeNum >= 1 && e.typeNum <= 4) {
-        const type = TYPE_NAME[e.typeNum];
-        const oid = storeObject(rec, type, e.data as Buffer);
-        resolvedOid.set(e.offset, oid);
-        stored.push(oid);
-        progress = true;
-      } else if (e.typeNum === 6 || e.typeNum === 7) {
-        let baseObj: GitObj | null = null;
-        if (e.typeNum === 7 && e.baseOid !== null) {
-          baseObj = getObject(rec, e.baseOid);
-        } else if (e.typeNum === 6) {
-          const baseEntry = byOffset.get(e.baseOffset);
-          if (baseEntry !== undefined && resolvedOid.has(baseEntry.offset)) {
-            baseObj = getObject(rec, resolvedOid.get(baseEntry.offset) as string);
-          }
-        }
-        if (baseObj !== null) {
-          const result = applyDelta(baseObj.data, e.data as Buffer);
-          const oid = storeObject(rec, baseObj.type, result);
-          resolvedOid.set(e.offset, oid);
-          stored.push(oid);
-          progress = true;
+  // Second pass: turn entries into stored objects, resolving delta
+  // bases recursively (a base may itself be a delta in the same pack).
+  const resolved = new Map<number, string>();
+  const storedOids: string[] = [];
+  const resolveEntry = (entry: RawPackEntry): string => {
+    const memo = resolved.get(entry.offset);
+    if (memo !== undefined) return memo;
+    let oid: string;
+    if (entry.typeCode >= 1 && entry.typeCode <= 4) {
+      oid = storeObject(rec, PACK_TYPE_NAMES[entry.typeCode], entry.data);
+    } else {
+      let baseObj: GitObj | null = null;
+      if (entry.typeCode === 7 && entry.refBase !== null) {
+        baseObj = getObject(rec, entry.refBase);
+      } else if (entry.typeCode === 6) {
+        const baseEntry = rawByOffset.get(entry.ofsBase);
+        if (baseEntry !== undefined) {
+          baseObj = getObject(rec, resolveEntry(baseEntry));
         }
       }
+      if (baseObj === null) throw new Error("unresolved pack delta");
+      const rebuilt = applyDelta(baseObj.data, entry.data);
+      oid = storeObject(rec, baseObj.type, rebuilt);
     }
+    resolved.set(entry.offset, oid);
+    storedOids.push(oid);
+    return oid;
+  };
+  for (const entry of raw) {
+    resolveEntry(entry);
   }
-  if (resolvedOid.size !== entries.length) throw new Error("unresolved pack delta");
-  return stored;
+  if (resolved.size !== raw.length) throw new Error("unresolved pack delta");
+  return storedOids;
 }
 
 // ---------------------------------------------------------------------------
-// Trees
+// Trees. On the wire a tree is a run of "<mode> <name>\0<20-byte oid>"
+// records; entries sort by name, with directories sorting as if their
+// name ended in "/".
 // ---------------------------------------------------------------------------
 
 export interface TreeEntry {
@@ -352,126 +375,135 @@ export interface TreeEntry {
 
 export function parseTree(data: Buffer): TreeEntry[] {
   const entries: TreeEntry[] = [];
-  let pos = 0;
-  while (pos < data.length) {
-    const sp = data.indexOf(0x20, pos);
-    const mode = data.toString("ascii", pos, sp);
-    const nul = data.indexOf(0x00, sp + 1);
-    const name = data.toString("utf8", sp + 1, nul);
-    const oid = data.toString("hex", nul + 1, nul + 21);
-    entries.push({ mode: mode, name: name, oid: oid });
-    pos = nul + 21;
+  let cursor = 0;
+  while (cursor < data.length) {
+    const spaceAt = data.indexOf(0x20, cursor);
+    const nulAt = data.indexOf(0x00, spaceAt + 1);
+    entries.push({
+      mode: data.toString("ascii", cursor, spaceAt),
+      name: data.toString("utf8", spaceAt + 1, nulAt),
+      oid: data.toString("hex", nulAt + 1, nulAt + 21),
+    });
+    cursor = nulAt + 21;
   }
   return entries;
 }
 
-function treeSortKey(e: TreeEntry): string {
-  return e.mode === "40000" ? e.name + "/" : e.name;
+function treeEntrySortKey(entry: TreeEntry): string {
+  return entry.mode === "40000" ? entry.name + "/" : entry.name;
 }
 
 export function buildTreeData(entries: TreeEntry[]): Buffer {
-  const sorted = entries.slice().sort((a, b) => {
-    const ka = treeSortKey(a);
-    const kb = treeSortKey(b);
-    return ka < kb ? -1 : ka > kb ? 1 : 0;
-  });
-  const parts: Buffer[] = [];
-  for (const e of sorted) {
-    parts.push(Buffer.from(e.mode + " " + e.name + "\0", "utf8"));
-    parts.push(Buffer.from(e.oid, "hex"));
+  const decorated = entries.map((entry) => ({ key: treeEntrySortKey(entry), entry: entry }));
+  decorated.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+  const chunks: Buffer[] = [];
+  for (const item of decorated) {
+    chunks.push(Buffer.from(item.entry.mode + " " + item.entry.name + "\0", "utf8"));
+    chunks.push(Buffer.from(item.entry.oid, "hex"));
   }
-  return Buffer.concat(parts);
+  return Buffer.concat(chunks);
 }
 
-// Flatten a tree (recursively) into path -> {mode, oid}.
+// Flatten a tree and all its subtrees into a path -> {mode, oid} map.
+// Iterative, with an explicit stack of (tree oid, path prefix) pairs.
 export function flattenTree(
   rec: RepoRec,
   treeOid: string,
   prefix: string,
   out: Map<string, { mode: string; oid: string }>,
 ): void {
-  const obj = getObject(rec, treeOid);
-  if (obj === null || obj.type !== "tree") return;
-  for (const e of parseTree(obj.data)) {
-    const path = prefix === "" ? e.name : prefix + "/" + e.name;
-    if (e.mode === "40000") {
-      flattenTree(rec, e.oid, path, out);
-    } else {
-      out.set(path, { mode: e.mode, oid: e.oid });
+  const pending: Array<{ oid: string; prefix: string }> = [{ oid: treeOid, prefix: prefix }];
+  while (pending.length > 0) {
+    const current = pending.pop() as { oid: string; prefix: string };
+    const obj = getObject(rec, current.oid);
+    if (obj === null || obj.type !== "tree") continue;
+    for (const entry of parseTree(obj.data)) {
+      const path = current.prefix === "" ? entry.name : current.prefix + "/" + entry.name;
+      if (entry.mode === "40000") {
+        pending.push({ oid: entry.oid, prefix: path });
+      } else {
+        out.set(path, { mode: entry.mode, oid: entry.oid });
+      }
     }
   }
 }
 
-// Rebuild nested trees from a flat path map; returns the root tree OID.
+// Rebuild the nested tree hierarchy for a flat path map and store every
+// level; returns the root tree's OID.
 export function buildTreeFromFlat(
   rec: RepoRec,
   flat: Map<string, { mode: string; oid: string }>,
 ): string {
-  interface Node {
+  interface DirNode {
     files: TreeEntry[];
-    dirs: Map<string, Node>;
+    subdirs: Map<string, DirNode>;
   }
-  const root: Node = { files: [], dirs: new Map() };
-  for (const [path, v] of flat) {
-    const segs = path.split("/");
+  const newDir = (): DirNode => ({ files: [], subdirs: new Map() });
+  const root = newDir();
+  for (const [path, value] of flat) {
+    const segments = path.split("/");
     let node = root;
-    for (let i = 0; i < segs.length - 1; i++) {
-      let child = node.dirs.get(segs[i]);
+    for (let i = 0; i + 1 < segments.length; i++) {
+      let child = node.subdirs.get(segments[i]);
       if (child === undefined) {
-        child = { files: [], dirs: new Map() };
-        node.dirs.set(segs[i], child);
+        child = newDir();
+        node.subdirs.set(segments[i], child);
       }
       node = child;
     }
-    node.files.push({ mode: v.mode, name: segs[segs.length - 1], oid: v.oid });
+    node.files.push({
+      mode: value.mode,
+      name: segments[segments.length - 1],
+      oid: value.oid,
+    });
   }
-  const build = (node: Node): string => {
-    const entries: TreeEntry[] = node.files.slice();
-    for (const [name, child] of node.dirs) {
-      entries.push({ mode: "40000", name: name, oid: build(child) });
+  const storeDir = (node: DirNode): string => {
+    const entries: TreeEntry[] = [];
+    for (const file of node.files) entries.push(file);
+    for (const [name, child] of node.subdirs) {
+      entries.push({ mode: "40000", name: name, oid: storeDir(child) });
     }
     return storeObject(rec, "tree", buildTreeData(entries));
   };
-  return build(root);
+  return storeDir(root);
 }
 
-// Deterministic 3-way merge of flat tree maps. On a true conflict the
-// "theirs" (head) side wins, which keeps merges total and reproducible.
+// Three-way merge over flat path maps. A path changed on only one side
+// takes that side's version; a path changed on both sides in the same
+// way takes the shared result; a true conflict resolves to "theirs"
+// (the head side), which keeps every merge total and reproducible.
 export function mergeFlat(
   base: Map<string, { mode: string; oid: string }>,
   ours: Map<string, { mode: string; oid: string }>,
   theirs: Map<string, { mode: string; oid: string }>,
 ): Map<string, { mode: string; oid: string }> {
-  const out = new Map<string, { mode: string; oid: string }>();
-  const keys = new Set<string>();
-  for (const k of base.keys()) keys.add(k);
-  for (const k of ours.keys()) keys.add(k);
-  for (const k of theirs.keys()) keys.add(k);
-  const sortedKeys = Array.from(keys).sort();
-  const eq = (
-    a: { mode: string; oid: string } | undefined,
-    b: { mode: string; oid: string } | undefined,
-  ): boolean => {
-    if (a === undefined && b === undefined) return true;
-    if (a === undefined || b === undefined) return false;
+  type Spot = { mode: string; oid: string };
+  const sameSpot = (a: Spot | undefined, b: Spot | undefined): boolean => {
+    if (a === undefined || b === undefined) return a === b;
     return a.oid === b.oid && a.mode === b.mode;
   };
-  for (const k of sortedKeys) {
-    const b = base.get(k);
-    const o = ours.get(k);
-    const t = theirs.get(k);
-    let pick: { mode: string; oid: string } | undefined;
-    if (eq(o, t)) pick = o;
-    else if (eq(b, o)) pick = t;
-    else if (eq(b, t)) pick = o;
-    else pick = t; // conflict: head wins
-    if (pick !== undefined) out.set(k, pick);
+  const allPaths = new Set<string>();
+  for (const map of [base, ours, theirs]) {
+    for (const key of map.keys()) allPaths.add(key);
   }
-  return out;
+  const merged = new Map<string, Spot>();
+  for (const path of Array.from(allPaths).sort()) {
+    const b = base.get(path);
+    const o = ours.get(path);
+    const t = theirs.get(path);
+    let winner: Spot | undefined;
+    if (sameSpot(o, t)) winner = o;
+    else if (sameSpot(b, o)) winner = t;
+    else if (sameSpot(b, t)) winner = o;
+    else winner = t;
+    if (winner !== undefined) merged.set(path, winner);
+  }
+  return merged;
 }
 
 // ---------------------------------------------------------------------------
-// Commits
+// Commits. The header block is "key value" lines (tree, parent*,
+// author, committer), then a blank line, then the free-form message.
 // ---------------------------------------------------------------------------
 
 export interface CommitInfo {
@@ -484,28 +516,34 @@ export interface CommitInfo {
 
 export function parseCommit(data: Buffer): CommitInfo {
   const text = data.toString("utf8");
-  const sep = text.indexOf("\n\n");
-  const head = sep >= 0 ? text.slice(0, sep) : text;
-  const message = sep >= 0 ? text.slice(sep + 2) : "";
-  let tree = ZERO_OID;
-  const parents: string[] = [];
-  let author = "";
-  let committer = "";
-  for (const line of head.split("\n")) {
-    if (line.startsWith("tree ")) tree = line.slice(5).trim();
-    else if (line.startsWith("parent ")) parents.push(line.slice(7).trim());
-    else if (line.startsWith("author ")) author = line.slice(7);
-    else if (line.startsWith("committer ")) committer = line.slice(10);
+  const blankAt = text.indexOf("\n\n");
+  const headerText = blankAt === -1 ? text : text.slice(0, blankAt);
+  const info: CommitInfo = {
+    tree: ZERO_OID,
+    parents: [],
+    author: "",
+    committer: "",
+    message: blankAt === -1 ? "" : text.slice(blankAt + 2),
+  };
+  for (const line of headerText.split("\n")) {
+    const spaceAt = line.indexOf(" ");
+    if (spaceAt === -1) continue;
+    const key = line.slice(0, spaceAt);
+    const value = line.slice(spaceAt + 1);
+    if (key === "tree") info.tree = value.trim();
+    else if (key === "parent") info.parents.push(value.trim());
+    else if (key === "author") info.author = value;
+    else if (key === "committer") info.committer = value;
   }
-  return { tree: tree, parents: parents, author: author, committer: committer, message: message };
+  return info;
 }
 
 export function buildCommitData(info: CommitInfo): Buffer {
-  let head = "tree " + info.tree + "\n";
-  for (const p of info.parents) head += "parent " + p + "\n";
-  head += "author " + info.author + "\n";
-  head += "committer " + info.committer + "\n";
-  return Buffer.from(head + "\n" + info.message, "utf8");
+  const lines: string[] = ["tree " + info.tree];
+  for (const parent of info.parents) lines.push("parent " + parent);
+  lines.push("author " + info.author);
+  lines.push("committer " + info.committer);
+  return Buffer.from(lines.join("\n") + "\n\n" + info.message, "utf8");
 }
 
 // Create a commit authored by the forge bot at the current logical tick.
@@ -516,13 +554,14 @@ export function makeCommit(
   message: string,
 ): string {
   const ident = BOT_IDENT + " " + gitTimestampNow();
-  return storeObject(rec, "commit", buildCommitData({
+  const data = buildCommitData({
     tree: treeOid,
     parents: parents,
     author: ident,
     committer: ident,
     message: message,
-  }));
+  });
+  return storeObject(rec, "commit", data);
 }
 
 export function commitTreeOid(rec: RepoRec, commitOid: string): string | null {
@@ -531,27 +570,38 @@ export function commitTreeOid(rec: RepoRec, commitOid: string): string | null {
   return parseCommit(obj.data).tree;
 }
 
-// Breadth-first ancestor test (is `anc` reachable from `desc`?).
+// Reachability over the parent graph: is `anc` an ancestor of `desc`
+// (or the same commit)? Depth-first with a visited set.
 export function isAncestor(rec: RepoRec, anc: string, desc: string): boolean {
-  if (anc === desc) return true;
-  const seen = new Set<string>();
-  const queue: string[] = [desc];
-  while (queue.length > 0) {
-    const cur = queue.shift() as string;
-    if (cur === anc) return true;
-    if (seen.has(cur)) continue;
-    seen.add(cur);
-    const obj = getObject(rec, cur);
+  const visited = new Set<string>();
+  const stack: string[] = [desc];
+  while (stack.length > 0) {
+    const current = stack.pop() as string;
+    if (current === anc) return true;
+    if (visited.has(current)) continue;
+    visited.add(current);
+    const obj = getObject(rec, current);
     if (obj === null || obj.type !== "commit") continue;
-    for (const p of parseCommit(obj.data).parents) queue.push(p);
+    for (const parent of parseCommit(obj.data).parents) {
+      stack.push(parent);
+    }
   }
   return false;
 }
 
-// Collect the object set for a fetch.
-// - depthLimit null: full closure of wants minus the full closure of haves.
-// - depthLimit N: commits within N steps of wants (their complete trees and
-//   blobs); `shallow` lists the boundary commits that still have parents.
+// ---------------------------------------------------------------------------
+// Fetch object selection.
+//
+// Full fetches (depthLimit null) send the closure of the wants minus
+// the closure of the haves. Depth-limited fetches send the commits
+// within depthLimit steps of the wants together with their complete
+// trees; commits sitting exactly at the depth boundary are reported
+// as `shallow` when the cut leaves them with un-sent parents. A commit
+// the client already has is still walked through in depth mode (so
+// deepening a shallow clone counts depth correctly), but neither it
+// nor its tree is sent again.
+// ---------------------------------------------------------------------------
+
 export function collectFetchObjects(
   rec: RepoRec,
   wants: string[],
@@ -559,101 +609,96 @@ export function collectFetchObjects(
   depthLimit: number | null,
 ): { oids: string[]; shallow: string[] } {
   const haveSet = new Set<string>(haves);
+
+  // Objects the client provably holds (full mode only): every object
+  // reachable from any have, commits, trees and blobs alike.
   const excluded = new Set<string>();
-  if (depthLimit === null && haves.length > 0) {
-    // Full closure of haves is excluded from the pack.
-    const stack: string[] = haves.slice();
-    while (stack.length > 0) {
-      const oid = stack.pop() as string;
+  if (depthLimit === null) {
+    const pending = haves.slice();
+    while (pending.length > 0) {
+      const oid = pending.pop() as string;
       if (excluded.has(oid)) continue;
       const obj = getObject(rec, oid);
       if (obj === null) continue;
       excluded.add(oid);
       if (obj.type === "commit") {
-        const c = parseCommit(obj.data);
-        stack.push(c.tree);
-        for (const p of c.parents) stack.push(p);
+        const commit = parseCommit(obj.data);
+        pending.push(commit.tree);
+        for (const parent of commit.parents) pending.push(parent);
       } else if (obj.type === "tree") {
-        for (const e of parseTree(obj.data)) stack.push(e.oid);
+        for (const entry of parseTree(obj.data)) pending.push(entry.oid);
       }
     }
   }
 
   const included = new Set<string>();
-  const shallow: string[] = [];
-  const includeTree = (treeOid: string): void => {
-    const stack: string[] = [treeOid];
-    while (stack.length > 0) {
-      const oid = stack.pop() as string;
+  const sweepTree = (rootOid: string): void => {
+    const pending: string[] = [rootOid];
+    while (pending.length > 0) {
+      const oid = pending.pop() as string;
       if (included.has(oid) || excluded.has(oid)) continue;
       const obj = getObject(rec, oid);
       if (obj === null) continue;
       included.add(oid);
       if (obj.type === "tree") {
-        for (const e of parseTree(obj.data)) stack.push(e.oid);
+        for (const entry of parseTree(obj.data)) pending.push(entry.oid);
       }
     }
   };
 
+  const shallowSet = new Set<string>();
+
   if (depthLimit === null) {
-    const queue: string[] = wants.slice();
     const seenCommits = new Set<string>();
-    while (queue.length > 0) {
-      const oid = queue.shift() as string;
+    const pending = wants.slice();
+    while (pending.length > 0) {
+      const oid = pending.pop() as string;
       if (seenCommits.has(oid) || haveSet.has(oid) || excluded.has(oid)) continue;
       const obj = getObject(rec, oid);
       if (obj === null) continue;
       if (obj.type === "commit") {
         seenCommits.add(oid);
         included.add(oid);
-        const c = parseCommit(obj.data);
-        includeTree(c.tree);
-        for (const p of c.parents) queue.push(p);
+        const commit = parseCommit(obj.data);
+        sweepTree(commit.tree);
+        for (const parent of commit.parents) pending.push(parent);
       } else {
         included.add(oid);
-        if (obj.type === "tree") includeTree(oid);
+        if (obj.type === "tree") sweepTree(oid);
       }
     }
   } else {
-    // Depth-limited BFS over commits.
-    let frontier: string[] = wants.slice();
     const seenCommits = new Set<string>();
+    let ring = wants.slice();
     let depth = 0;
-    while (frontier.length > 0 && depth < depthLimit) {
-      const next: string[] = [];
-      for (const oid of frontier) {
+    while (ring.length > 0 && depth < depthLimit) {
+      const atBoundary = depth + 1 >= depthLimit;
+      const nextRing: string[] = [];
+      for (const oid of ring) {
         if (seenCommits.has(oid)) continue;
         const obj = getObject(rec, oid);
         if (obj === null || obj.type !== "commit") continue;
         seenCommits.add(oid);
-        const c = parseCommit(obj.data);
-        // A commit the client already has (a `have` — e.g. its own tip when
-        // deepening a shallow clone) is traversed so the depth count and the
-        // new boundary are right, but it is not re-sent, and neither is its
-        // tree: the client already holds both.
+        const commit = parseCommit(obj.data);
         if (!haveSet.has(oid)) {
           included.add(oid);
-          includeTree(c.tree);
+          sweepTree(commit.tree);
         }
-        const isBoundary = depth + 1 >= depthLimit;
-        for (const p of c.parents) {
-          if (isBoundary) {
-            if (!shallow.includes(oid)) shallow.push(oid);
-          } else {
-            next.push(p);
-          }
+        for (const parent of commit.parents) {
+          if (atBoundary) shallowSet.add(oid);
+          else nextRing.push(parent);
         }
       }
-      frontier = next;
-      depth++;
+      ring = nextRing;
+      depth += 1;
     }
-    shallow.sort();
   }
 
-  const oids = Array.from(included).sort();
-  return { oids: oids, shallow: shallow };
+  return {
+    oids: Array.from(included).sort(),
+    shallow: Array.from(shallowSet).sort(),
+  };
 }
-
 // ---------------------------------------------------------------------------
 // Ref helpers
 // ---------------------------------------------------------------------------
