@@ -1,12 +1,10 @@
-// main.ts — Standalone GitHub-compatible git forge: one process serving
-// Git Smart HTTP, the REST v3 API, GraphQL v4 and MCP from a single
-// in-memory store. Zero dependencies (Node.js 22 standard library only).
+// main.ts — entrypoint of the standalone GitHub-compatible git forge.
 //
-//   node --experimental-strip-types /bot/main.ts
-//
-// Determinism contract: no Date.now(), no Math.random(), no wall-clock
-// reads anywhere — every timestamp comes from the cached logical clock in
-// clock.ts, so identical request sequences replay byte-identically.
+// One Node process hosts four surfaces over a single in-memory store:
+// git smart HTTP, the REST v3 API, GraphQL v4, and an MCP endpoint.
+// Nothing here reads the wall clock or a random source; every timestamp
+// comes from the logical clock in clock.ts, so a fixed sequence of
+// requests always produces the same bytes back.
 
 import * as http from "node:http";
 import * as zlib from "node:zlib";
@@ -26,36 +24,45 @@ import { handleGraphQL } from "./graphql.ts";
 import { handleMcp } from "./mcp.ts";
 
 // ---------------------------------------------------------------------------
-// Single-allocation request body reader: when Content-Length is known the
-// body lands in exactly one pre-sized Buffer (chunk.copy), so sequential
-// POST/push workloads do not pay per-chunk allocation or GC pauses.
+// Request body collection. When the client declares a Content-Length,
+// the body is gathered into one pre-sized Buffer so a large push does
+// not allocate per chunk; otherwise chunks are concatenated at the end.
+// A stream error still delivers whatever arrived, mirroring a truncated
+// upload rather than hanging the request.
 // ---------------------------------------------------------------------------
 
-function readBody(req: IncomingMessage, cb: (body: Buffer) => void): void {
-  const lenHeader = req.headers["content-length"];
-  const len = lenHeader === undefined ? -1 : parseInt(lenHeader, 10);
-  if (len >= 0) {
-    if (len === 0) {
-      cb(Buffer.alloc(0));
-      return;
-    }
-    const buf = Buffer.allocUnsafe(len);
-    let offset = 0;
-    req.on("data", (chunk: Buffer) => {
-      chunk.copy(buf, offset);
-      offset += chunk.length;
-    });
-    req.on("end", () => cb(buf.subarray(0, offset)));
-    req.on("error", () => cb(buf.subarray(0, offset)));
+function collectBody(req: IncomingMessage, done: (body: Buffer) => void): void {
+  const declared = req.headers["content-length"];
+  const expected = declared === undefined ? -1 : Number.parseInt(declared, 10);
+
+  if (expected === 0) {
+    done(Buffer.alloc(0));
     return;
   }
-  const chunks: Buffer[] = [];
-  req.on("data", (chunk: Buffer) => chunks.push(chunk));
-  req.on("end", () => cb(Buffer.concat(chunks)));
-  req.on("error", () => cb(Buffer.concat(chunks)));
+  if (expected > 0) {
+    const target = Buffer.allocUnsafe(expected);
+    let filled = 0;
+    const finish = (): void => done(target.subarray(0, filled));
+    req.on("data", (chunk: Buffer) => {
+      chunk.copy(target, filled);
+      filled += chunk.length;
+    });
+    req.on("end", finish);
+    req.on("error", finish);
+    return;
+  }
+  const parts: Buffer[] = [];
+  const finishConcat = (): void => done(Buffer.concat(parts));
+  req.on("data", (chunk: Buffer) => {
+    parts.push(chunk);
+  });
+  req.on("end", finishConcat);
+  req.on("error", finishConcat);
 }
 
-function sendPlainJson(res: ServerResponse, status: number, text: string): void {
+// Small JSON replies produced by the router itself (health, auth and
+// not-found responses) all share the forge's header set.
+function replyJson(res: ServerResponse, status: number, text: string): void {
   const body = Buffer.from(text, "utf8");
   res.sendDate = false;
   res.cork();
@@ -70,52 +77,65 @@ function sendPlainJson(res: ServerResponse, status: number, text: string): void 
   res.uncork();
 }
 
-// The trial harness hands the entry its only credential as an environment
-// variable; when it is set, every surface except /healthz requires the
-// matching Bearer token and refuses anything else with a 401.
+const NOT_FOUND_BODY = '{"message":"Not Found"}';
+
+// The trial harness passes its credential in MAKEFUN_SHOP_TOKEN. When
+// the variable is set, every surface except the boot probe requires a
+// matching Bearer token; when it is absent (standalone runs) no check
+// is applied.
 const SHOP_TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? "";
 
+function tokenAccepted(req: IncomingMessage): boolean {
+  if (SHOP_TOKEN === "") return true;
+  return req.headers["authorization"] === "Bearer " + SHOP_TOKEN;
+}
+
 // ---------------------------------------------------------------------------
-// Routing. Path segments are located with indexOf scanning; the three API
-// surfaces are prefix-dispatched, everything else is a git route of the
-// form /:owner/:repo[.git]/<endpoint>.
+// Routing. Fixed API prefixes are matched first; anything else is tried
+// as a git URL of the form /<owner>/<repo>[.git]/<endpoint>.
 // ---------------------------------------------------------------------------
 
-async function dispatch(req: IncomingMessage, res: ServerResponse, body: Buffer): Promise<void> {
-  const rawUrl = req.url === undefined ? "/" : req.url;
-  const q = rawUrl.indexOf("?");
-  const path = q >= 0 ? rawUrl.slice(0, q) : rawUrl;
-  const query = parseQuery(q >= 0 ? rawUrl.slice(q + 1) : "");
-  const method = req.method === undefined ? "GET" : req.method;
+async function routeRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  body: Buffer,
+): Promise<void> {
+  const url = req.url ?? "/";
+  const qmark = url.indexOf("?");
+  const path = qmark === -1 ? url : url.slice(0, qmark);
+  const query = parseQuery(qmark === -1 ? "" : url.slice(qmark + 1));
+  const method = req.method ?? "GET";
 
-  // The harness boot probe: no credential, always the same tiny body.
+  // Boot probe for the harness: unauthenticated, constant body.
   if (path === "/healthz") {
-    if (method === "GET") sendPlainJson(res, 200, '{"ok":true}');
-    else sendPlainJson(res, 404, '{"message":"Not Found"}');
+    if (method === "GET") replyJson(res, 200, '{"ok":true}');
+    else replyJson(res, 404, NOT_FOUND_BODY);
     return;
   }
 
-  if (SHOP_TOKEN !== "" && req.headers["authorization"] !== "Bearer " + SHOP_TOKEN) {
-    sendPlainJson(res, 401, '{"message":"Bad credentials"}');
+  if (!tokenAccepted(req)) {
+    replyJson(res, 401, '{"message":"Bad credentials"}');
     return;
   }
 
-  if (path === "/api/graphql") {
-    if (method === "POST") handleGraphQL(res, body);
-    else sendPlainJson(res, 404, '{"message":"Not Found"}');
+  if (path === "/api/graphql" || path === "/mcp") {
+    if (method !== "POST") {
+      replyJson(res, 404, NOT_FOUND_BODY);
+    } else if (path === "/api/graphql") {
+      handleGraphQL(res, body);
+    } else {
+      handleMcp(res, body);
+    }
     return;
   }
-  if (path === "/mcp") {
-    if (method === "POST") handleMcp(res, body);
-    else sendPlainJson(res, 404, '{"message":"Not Found"}');
-    return;
-  }
+
   if (path === "/api/v3" || path.startsWith("/api/v3/")) {
-    handleRest(req, res, path, query, rawUrl, body);
+    handleRest(req, res, path, query, url, body);
     return;
   }
-  if (path === "/" || path === "") {
-    sendPlainJson(
+
+  if (path === "" || path === "/") {
+    replyJson(
       res,
       200,
       '{"name":"standalone-git-forge","version":"1.0.0","agent":"standalone-forge/1.0"}',
@@ -123,69 +143,63 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, body: Buffer)
     return;
   }
 
-  // Git routes: /:owner/:repo[.git]/info/refs | git-upload-pack | git-receive-pack
-  const segs = splitPath(path);
-  if (segs.length >= 3) {
-    const owner = segs[0];
-    let repoName = segs[1];
-    if (repoName.endsWith(".git")) repoName = repoName.slice(0, repoName.length - 4);
-    const rec = getRepo(owner, repoName);
-    if (rec === null) {
-      sendPlainJson(res, 404, '{"message":"Not Found"}');
-      return;
-    }
-    const tail = segs.slice(2).join("/");
-    if (tail === "info/refs" && method === "GET") {
-      handleInfoRefs(req, res, rec, query.get("service") ?? "");
-      return;
-    }
-    if (tail === "git-upload-pack" && method === "POST") {
-      await handleUploadPack(res, rec, owner + "/" + repoName, body);
-      return;
-    }
-    if (tail === "git-receive-pack" && method === "POST") {
-      handleReceivePack(res, rec, owner + "/" + repoName, body);
-      return;
+  const segments = splitPath(path);
+  if (segments.length >= 3) {
+    const owner = segments[0];
+    let repo = segments[1];
+    if (repo.endsWith(".git")) repo = repo.slice(0, repo.length - 4);
+    const rec = getRepo(owner, repo);
+    if (rec !== null) {
+      const endpoint = segments.slice(2).join("/");
+      const repoKey = owner + "/" + repo;
+      if (endpoint === "info/refs" && method === "GET") {
+        handleInfoRefs(req, res, rec, query.get("service") ?? "");
+        return;
+      }
+      if (endpoint === "git-upload-pack" && method === "POST") {
+        await handleUploadPack(res, rec, repoKey, body);
+        return;
+      }
+      if (endpoint === "git-receive-pack" && method === "POST") {
+        handleReceivePack(res, rec, repoKey, body);
+        return;
+      }
     }
   }
-  sendPlainJson(res, 404, '{"message":"Not Found"}');
+  replyJson(res, 404, NOT_FOUND_BODY);
 }
 
 // ---------------------------------------------------------------------------
-// Pre-listen JIT warmup: exercise the hot primitives once so V8 compiles
-// them before the first real request, then reset all state so the process
-// starts from the exact deterministic origin.
+// Warmup: run the hot primitives once before the first request so the
+// JIT has compiled them, then reset store and clock so the process
+// still starts from the exact deterministic origin.
 // ---------------------------------------------------------------------------
 
-function warmup(): void {
-  const sample = JSON.stringify({ a: [1, 2, 3], b: "warmup", c: { d: true } });
-  JSON.parse(sample);
-  const buf = Buffer.from(sample, "utf8");
-  crypto.createHash("sha1").update(buf).digest("hex");
-  const deflated = zlib.deflateSync(buf, { level: 0 });
-  zlib.inflateSync(deflated);
-  const line = pktLine("warmup\n");
-  parsePkt(line, 0);
-  const big = Buffer.allocUnsafe(65536);
-  big.fill(7);
-  zlib.deflateSync(big, { level: 0 });
+function warmupPrimitives(): void {
+  const probe = JSON.stringify({ probe: [1, 2, 3], nested: { flag: true } });
+  JSON.parse(probe);
+  const probeBytes = Buffer.from(probe, "utf8");
+  crypto.createHash("sha1").update(probeBytes).digest("hex");
+  const packed = zlib.deflateSync(probeBytes, { level: 0 });
+  zlib.inflateSync(packed);
+  parsePkt(pktLine("warmup\n"), 0);
+  const bulk = Buffer.allocUnsafe(65536);
+  bulk.fill(7);
+  zlib.deflateSync(bulk, { level: 0 });
   resetStore();
   resetClock();
 }
 
-function createForgeServer(): http.Server {
+function buildServer(): http.Server {
   const server = http.createServer((req: IncomingMessage, res: ServerResponse) => {
     res.sendDate = false;
-    readBody(req, (body) => {
-      dispatch(req, res, body).catch(() => {
+    collectBody(req, (body) => {
+      routeRequest(req, res, body).catch(() => {
         try {
-          if (!res.headersSent) {
-            sendPlainJson(res, 500, '{"message":"Internal Server Error"}');
-          } else {
-            res.end();
-          }
+          if (res.headersSent) res.end();
+          else replyJson(res, 500, '{"message":"Internal Server Error"}');
         } catch {
-          // socket already gone; nothing deterministic left to say
+          // The socket is already gone; there is nothing left to send.
         }
       });
     });
@@ -198,26 +212,31 @@ function createForgeServer(): http.Server {
   return server;
 }
 
-warmup();
+warmupPrimitives();
 
 // ---------------------------------------------------------------------------
-// Lifecycle. Under the trial harness (MAKEFUN_ENV_URL set) the process binds
-// an ephemeral port, registers it with the env, serves until the env says
-// the trial is done, then exits 0. Standalone (no env URL) it listens on
-// PORT (default 3000) and serves until killed.
+// Lifecycle. With MAKEFUN_ENV_URL set (trial harness) the server binds
+// an ephemeral port, registers it, and serves until the env reports
+// done, then exits 0. Without it, the server listens on PORT (default
+// 3000) until killed.
 // ---------------------------------------------------------------------------
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? "").replace(/\/+$/, "");
 
-const sleepMs = (ms: number): Promise<void> =>
-  new Promise((resolve) => setTimeout(resolve, ms));
-
-function retryDelay(attempt: number): number {
-  return Math.min(2000, 250 * 2 ** Math.min(attempt, 8));
+function pause(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function registerWithEnv(port: number): Promise<void> {
+// Exponential backoff shared by the env handshake loops: 250 ms,
+// doubling per attempt, capped at 2 s.
+function backoffMs(attempt: number): number {
+  const steps = Math.min(attempt, 8);
+  return Math.min(2000, 250 * 2 ** steps);
+}
+
+async function announcePort(port: number): Promise<void> {
   for (let attempt = 0; ; attempt++) {
+    let fatalStatus = 0;
     try {
       const res = await fetch(ENV_URL + "/register", {
         method: "POST",
@@ -226,46 +245,49 @@ async function registerWithEnv(port: number): Promise<void> {
         signal: AbortSignal.timeout(30000),
       });
       if (res.status === 200 || res.status === 409) return;
-      if (res.status === 400 || res.status === 405) {
-        throw new Error("register answered HTTP " + res.status);
-      }
-    } catch (e) {
-      if (e instanceof Error && e.message.startsWith("register answered HTTP ")) throw e;
+      if (res.status === 400 || res.status === 405) fatalStatus = res.status;
+    } catch {
+      // Network-level failure: fall through and retry.
     }
-    await sleepMs(retryDelay(attempt));
+    if (fatalStatus !== 0) {
+      throw new Error("register answered HTTP " + fatalStatus);
+    }
+    await pause(backoffMs(attempt));
   }
 }
 
-async function waitForEnvDone(): Promise<void> {
+async function awaitEnvDone(): Promise<void> {
   for (let attempt = 0; ; attempt++) {
     try {
-      const res = await fetch(ENV_URL + "/done", { signal: AbortSignal.timeout(30000) });
+      const res = await fetch(ENV_URL + "/done", {
+        signal: AbortSignal.timeout(30000),
+      });
       if (res.ok) {
-        const body = (await res.json()) as { done?: unknown };
-        if (body.done === true) return;
+        const payload = (await res.json()) as { done?: unknown };
+        if (payload.done === true) return;
       }
     } catch {
-      // env not answering yet: keep polling
+      // The env is not answering yet; keep polling.
     }
-    await sleepMs(retryDelay(attempt));
+    await pause(backoffMs(attempt));
   }
 }
 
-if (ENV_URL !== "") {
-  const server = createForgeServer();
+if (ENV_URL === "") {
+  const port = Number(process.env.PORT || 3000);
+  buildServer().listen(port, "0.0.0.0");
+} else {
+  const server = buildServer();
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(0, "0.0.0.0", () => resolve());
   });
-  const address = server.address();
-  if (address === null || typeof address === "string") {
+  const bound = server.address();
+  if (bound === null || typeof bound === "string") {
     throw new Error("the server did not bind an ephemeral TCP port");
   }
-  await registerWithEnv(address.port);
-  await waitForEnvDone();
+  await announcePort(bound.port);
+  await awaitEnvDone();
   server.close();
   process.exit(0);
-} else {
-  const PORT = Number(process.env.PORT || 3000);
-  createForgeServer().listen(PORT, "0.0.0.0");
 }
