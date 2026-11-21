@@ -622,13 +622,19 @@ export function collectFetchObjects(
     while (frontier.length > 0 && depth < depthLimit) {
       const next: string[] = [];
       for (const oid of frontier) {
-        if (seenCommits.has(oid) || haveSet.has(oid)) continue;
+        if (seenCommits.has(oid)) continue;
         const obj = getObject(rec, oid);
         if (obj === null || obj.type !== "commit") continue;
         seenCommits.add(oid);
-        included.add(oid);
         const c = parseCommit(obj.data);
-        includeTree(c.tree);
+        // A commit the client already has (a `have` — e.g. its own tip when
+        // deepening a shallow clone) is traversed so the depth count and the
+        // new boundary are right, but it is not re-sent, and neither is its
+        // tree: the client already holds both.
+        if (!haveSet.has(oid)) {
+          included.add(oid);
+          includeTree(c.tree);
+        }
         const isBoundary = depth + 1 >= depthLimit;
         for (const p of c.parents) {
           if (isBoundary) {
