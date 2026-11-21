@@ -1,10 +1,11 @@
-// store.ts — Pure in-memory V8 storage.
+// store.ts — the forge's entire state, held in plain in-memory maps.
 //
-// Everything lives in native Map/Array structures for O(1) access with no
-// FFI or SQL cost. Entity records are built by factory functions that
-// always assign properties in the same order with the same types (null
-// instead of undefined) so V8 keeps monomorphic object shapes and fast
-// inline caches.
+// There is no database and no disk state: repositories, git objects,
+// issues, pull requests, comments and labels all live in Map instances
+// owned by this module. Factory helpers create every record, and they
+// always populate the fields in a fixed order with null (never
+// undefined) for absent values, which keeps object shapes stable and
+// property access fast.
 
 import { isoNow } from "./clock.ts";
 
@@ -89,26 +90,36 @@ export function repoKeyOf(owner: string, name: string): string {
 
 export const repos: Map<string, RepoRec> = new Map();
 
-let nextRepoId = 1;
-let nextIssueId = 1;
-let nextPrId = 1;
-let nextCommentId = 1;
-let nextLabelId = 1;
+// One counter per entity kind, all starting at 1. They live in a single
+// record so resetStore() can restart every sequence with one loop.
+const idCounters = {
+  repo: 1,
+  issue: 1,
+  pr: 1,
+  comment: 1,
+  label: 1,
+};
+
+function takeId(kind: keyof typeof idCounters): number {
+  const value = idCounters[kind];
+  idCounters[kind] = value + 1;
+  return value;
+}
 
 export function allocRepoId(): number {
-  return nextRepoId++;
+  return takeId("repo");
 }
 export function allocIssueId(): number {
-  return nextIssueId++;
+  return takeId("issue");
 }
 export function allocPrId(): number {
-  return nextPrId++;
+  return takeId("pr");
 }
 export function allocCommentId(): number {
-  return nextCommentId++;
+  return takeId("comment");
 }
 export function allocLabelId(): number {
-  return nextLabelId++;
+  return takeId("label");
 }
 
 export function makeRepo(
@@ -118,7 +129,7 @@ export function makeRepo(
   isPrivate: boolean,
   defaultBranch: string,
 ): RepoRec {
-  const now = isoNow();
+  const stamp = isoNow();
   const rec: RepoRec = {
     id: allocRepoId(),
     owner: owner,
@@ -126,8 +137,8 @@ export function makeRepo(
     description: description,
     isPrivate: isPrivate,
     defaultBranch: defaultBranch,
-    createdAt: now,
-    updatedAt: now,
+    createdAt: stamp,
+    updatedAt: stamp,
     refs: new Map(),
     objects: new Map(),
     issues: new Map(),
@@ -145,7 +156,7 @@ export function makeIssue(
   body: string | null,
   authorLogin: string,
 ): IssueRec {
-  const now = isoNow();
+  const stamp = isoNow();
   const issue: IssueRec = {
     id: allocIssueId(),
     number: rec.nextNumber++,
@@ -154,8 +165,8 @@ export function makeIssue(
     state: "open",
     labels: [],
     authorLogin: authorLogin,
-    createdAt: now,
-    updatedAt: now,
+    createdAt: stamp,
+    updatedAt: stamp,
     closedAt: null,
   };
   return issue;
@@ -172,7 +183,7 @@ export function makePr(
   baseSha: string,
   authorLogin: string,
 ): PrRec {
-  const now = isoNow();
+  const stamp = isoNow();
   const pr: PrRec = {
     id: allocPrId(),
     number: rec.nextNumber++,
@@ -187,8 +198,8 @@ export function makePr(
     merged: false,
     mergeCommitSha: null,
     authorLogin: authorLogin,
-    createdAt: now,
-    updatedAt: now,
+    createdAt: stamp,
+    updatedAt: stamp,
     closedAt: null,
     mergedAt: null,
   };
@@ -200,27 +211,31 @@ export function makeComment(
   body: string,
   authorLogin: string,
 ): CommentRec {
-  const now = isoNow();
+  const stamp = isoNow();
   const comment: CommentRec = {
     id: allocCommentId(),
     issueNumber: issueNumber,
     body: body,
     authorLogin: authorLogin,
-    createdAt: now,
-    updatedAt: now,
+    createdAt: stamp,
+    updatedAt: stamp,
   };
   return comment;
 }
 
 export function getRepo(owner: string, name: string): RepoRec | null {
-  const rec = repos.get(repoKeyOf(owner, name));
-  return rec === undefined ? null : rec;
+  const found = repos.get(repoKeyOf(owner, name));
+  return found === undefined ? null : found;
 }
 
 // ---------------------------------------------------------------------------
-// Byte-budgeted LRU caches. Response cache entries remember the mutation
-// tick they were built at; a hit is only served when the tick still equals
-// the current tick, so any mutation transparently invalidates stale bytes.
+// Byte-budgeted LRU caches for pre-encoded responses.
+//
+// Each cached entry remembers the mutation tick at which its bytes were
+// produced. Readers compare that tick against the clock's current tick
+// and only serve the entry when they match, so any mutation anywhere in
+// the store quietly invalidates every stale response without the writer
+// needing to know which URLs exist.
 // ---------------------------------------------------------------------------
 
 interface CacheEntry {
@@ -233,75 +248,95 @@ export class ByteLru {
   map: Map<string, CacheEntry>;
   bytes: number;
   cap: number;
+
   constructor(cap: number) {
     this.map = new Map();
     this.bytes = 0;
     this.cap = cap;
   }
+
   get(key: string): CacheEntry | null {
-    const e = this.map.get(key);
-    if (e === undefined) return null;
-    // refresh recency
+    const hit = this.map.get(key);
+    if (hit === undefined) {
+      return null;
+    }
+    // Re-insert at the tail so iteration order stays recency-ordered.
     this.map.delete(key);
-    this.map.set(key, e);
-    return e;
+    this.map.set(key, hit);
+    return hit;
   }
+
   set(key: string, body: Buffer, tick: number): void {
-    const old = this.map.get(key);
-    if (old !== undefined) {
-      this.bytes -= old.size;
+    const previous = this.map.get(key);
+    if (previous !== undefined) {
+      this.bytes -= previous.size;
       this.map.delete(key);
     }
-    const size = body.length;
-    if (size > this.cap) return; // never cache something bigger than the cap
-    this.map.set(key, { body: body, tick: tick, size: size });
-    this.bytes += size;
+    if (body.length > this.cap) {
+      return; // a single entry larger than the budget is never cached
+    }
+    this.map.set(key, { body: body, tick: tick, size: body.length });
+    this.bytes += body.length;
+    // Evict least-recently-used entries (front of the map) until the
+    // total size is back within budget.
     while (this.bytes > this.cap) {
-      const first = this.map.keys().next();
-      if (first.done) break;
-      const e = this.map.get(first.value);
-      if (e !== undefined) this.bytes -= e.size;
-      this.map.delete(first.value);
+      const oldest = this.map.keys().next();
+      if (oldest.done) {
+        break;
+      }
+      const victim = this.map.get(oldest.value);
+      if (victim !== undefined) {
+        this.bytes -= victim.size;
+      }
+      this.map.delete(oldest.value);
     }
   }
+
   deletePrefix(prefix: string): void {
-    for (const k of this.map.keys()) {
-      if (k.startsWith(prefix)) {
-        const e = this.map.get(k);
-        if (e !== undefined) this.bytes -= e.size;
-        this.map.delete(k);
+    const doomed: string[] = [];
+    for (const key of this.map.keys()) {
+      if (key.startsWith(prefix)) {
+        doomed.push(key);
       }
     }
+    for (const key of doomed) {
+      const entry = this.map.get(key);
+      if (entry !== undefined) {
+        this.bytes -= entry.size;
+      }
+      this.map.delete(key);
+    }
   }
+
   clear(): void {
     this.map.clear();
     this.bytes = 0;
   }
 }
 
-// Pre-encoded GET response cache (headers are rebuilt from the entry's
-// stored tick -> cached HTTP date, body is the exact Buffer to send).
+// Cache of finished REST GET responses (64 MB budget).
 export const respCache = new ByteLru(64 * 1024 * 1024);
-// Full git-upload-pack wire-response cache (spec cap: 200 MB of the 250 MB
-// total wire/pack budget).
+// Cache of assembled git-upload-pack wire responses (200 MB budget).
 export const wireCache = new ByteLru(200 * 1024 * 1024);
-// Singleflight map for concurrent shallow-clone wire assembly.
+// In-flight wire assemblies, so concurrent identical fetches share work.
 export const inflightFetch: Map<string, Promise<Buffer>> = new Map();
 
 export function invalidateRepo(owner: string, name: string): void {
   const key = repoKeyOf(owner, name);
-  // All cached REST GETs for this repo live under /api/v3/repos/<owner>/<name>
+  // REST GET responses for a repo are keyed by their request path, and
+  // wire responses by "<owner>/<name>:...", so two prefix sweeps drop
+  // everything cached for the repo.
   respCache.deletePrefix("GET /api/v3/repos/" + key);
   wireCache.deletePrefix(key + ":");
 }
 
 export function resetStore(): void {
   repos.clear();
-  nextRepoId = 1;
-  nextIssueId = 1;
-  nextPrId = 1;
-  nextCommentId = 1;
-  nextLabelId = 1;
+  idCounters.repo = 1;
+  idCounters.issue = 1;
+  idCounters.pr = 1;
+  idCounters.comment = 1;
+  idCounters.label = 1;
   respCache.clear();
   wireCache.clear();
   inflightFetch.clear();

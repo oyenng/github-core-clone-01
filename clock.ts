@@ -1,55 +1,73 @@
-// clock.ts — Cached deterministic logical clock.
+// clock.ts — a logical clock for the forge; wall time is never consulted.
 //
-// ABSOLUTE RULE: nothing in this codebase may call Date.now(), new Date()
-// without a fixed argument, Math.random(), crypto.randomUUID() or
-// process.hrtime(). All timestamps derive from a logical mutation tick so
-// that two fresh instances replaying the same request sequence produce
-// byte-identical output.
+// Every timestamp the forge produces comes from one mutation counter.
+// The counter starts at zero and every state-changing operation in the
+// store bumps it by exactly one, so the current instant is always
+// EPOCH_SECONDS + counter. Replaying the same sequence of operations
+// therefore yields the same timestamps, byte for byte, on every run.
 //
-// The tick advances ONLY on state mutations (repo/issue/comment/PR/file
-// create-update-delete, git push, PR merge). GET handlers, clone, fetch,
-// ls-refs, tools/list and GraphQL queries only READ the cached strings.
+// Three renderings of the current instant are cached and rebuilt on each
+// bump: an ISO-8601 string for JSON bodies, an IMF-fixdate for HTTP
+// headers, and the "<unix> +0000" form git expects inside commits.
 
-let mutationTick = 0;
+const EPOCH_SECONDS = 1767225600; // 2026-01-01T00:00:00.000Z
 
-// Base instant: 2026-01-01T00:00:00.000Z == 1767225600000 ms since epoch.
-const BASE_MS = 1767225600000;
+const WEEKDAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTH_NAMES = [
+  "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
 
-let cachedIsoDate: string = "2026-01-01T00:00:00.000Z";
-let cachedHttpDate: string = "Thu, 01 Jan 2026 00:00:00 GMT";
-let cachedGitTimestamp: string = "1767225600 +0000";
+let counter = 0;
+let isoCache = "";
+let httpCache = "";
+let gitCache = "";
+
+function pad2(n: number): string {
+  return n < 10 ? "0" + n : "" + n;
+}
+
+function rebuildCaches(): void {
+  const instant = new Date((EPOCH_SECONDS + counter) * 1000);
+  const year = instant.getUTCFullYear();
+  const month = instant.getUTCMonth();
+  const day = instant.getUTCDate();
+  const hms =
+    pad2(instant.getUTCHours()) + ":" +
+    pad2(instant.getUTCMinutes()) + ":" +
+    pad2(instant.getUTCSeconds());
+  isoCache =
+    year + "-" + pad2(month + 1) + "-" + pad2(day) + "T" + hms + ".000Z";
+  httpCache =
+    WEEKDAY_NAMES[instant.getUTCDay()] + ", " + pad2(day) + " " +
+    MONTH_NAMES[month] + " " + year + " " + hms + " GMT";
+  gitCache = String(EPOCH_SECONDS + counter) + " +0000";
+}
+
+rebuildCaches();
 
 export function getTick(): number {
-  return mutationTick;
+  return counter;
 }
 
 export function isoNow(): string {
-  return cachedIsoDate;
+  return isoCache;
 }
 
 export function httpDateNow(): string {
-  return cachedHttpDate;
+  return httpCache;
 }
 
 export function gitTimestampNow(): string {
-  return cachedGitTimestamp;
+  return gitCache;
 }
 
-// Called exactly once per state mutation. Recomputes the three cached
-// string forms a single time so hot read paths never format dates.
 export function advanceTick(): void {
-  ++mutationTick;
-  const ms = BASE_MS + mutationTick * 1000;
-  const d = new Date(ms);
-  cachedIsoDate = d.toISOString();
-  cachedHttpDate = d.toUTCString();
-  cachedGitTimestamp = String(1767225600 + mutationTick) + " +0000";
+  counter += 1;
+  rebuildCaches();
 }
 
-// Test/warmup support: reset the clock back to the base instant.
 export function resetClock(): void {
-  mutationTick = 0;
-  cachedIsoDate = "2026-01-01T00:00:00.000Z";
-  cachedHttpDate = "Thu, 01 Jan 2026 00:00:00 GMT";
-  cachedGitTimestamp = "1767225600 +0000";
+  counter = 0;
+  rebuildCaches();
 }
